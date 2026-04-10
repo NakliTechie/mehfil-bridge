@@ -147,8 +147,9 @@ func loadOrCreateKeypair() {
 // ─── Envelope buffer ──────────────────────────────────────────────────────────
 
 const (
-	maxEnvsPerWS = 2000
-	envTTL       = 24 * time.Hour
+	maxEnvsPerWS    = 2000
+	envTTL          = 24 * time.Hour
+	maxPulledHashes = 10_000 // per-workspace cap on the relay loop-prevention set
 )
 
 func getOrCreateBuffer(wsId string) *wsBuffer {
@@ -286,8 +287,13 @@ func pullWorkspaceFromRelay(wsId string) error {
 		// Store in local LAN buffer so offline-LAN devices can pick it up.
 		buf.put(item.Data)
 
-		// Record that this envelope came from the relay.
+		// Record that this envelope came from the relay (loop prevention).
+		// If the map exceeds the cap, clear it — a brief echo window is
+		// preferable to unbounded memory growth.
 		state.mu.Lock()
+		if len(state.pulledHashes) >= maxPulledHashes {
+			state.pulledHashes = map[string]bool{}
+		}
 		state.pulledHashes[hashKey] = true
 		state.relayCursor = item.Seq
 		state.mu.Unlock()
@@ -454,9 +460,17 @@ func handleEnvelopes(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodPut:
-		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		// Envelopes are padded to exactly 1 KB. Accept up to 4 KB to allow
+		// for minor overhead, but reject anything larger — it's not a valid
+		// Mehfil envelope and could be used to bloat the in-memory buffer.
+		const maxEnvSize = 4 * 1024
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxEnvSize+1))
 		if err != nil || len(body) == 0 {
 			http.Error(w, "bad body", http.StatusBadRequest)
+			return
+		}
+		if len(body) > maxEnvSize {
+			http.Error(w, "envelope too large", http.StatusRequestEntityTooLarge)
 			return
 		}
 		data := base64.StdEncoding.EncodeToString(body)
