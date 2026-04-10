@@ -1,0 +1,6 @@
+bin/
+*.exe
+# Never commit the keypair
+key
+*.key
+~/.mehfil-bridge/
