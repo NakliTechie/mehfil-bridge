@@ -17,6 +17,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -70,11 +71,20 @@ type sigPeer struct {
 	send   chan []byte
 }
 
+// relaySyncState tracks per-workspace relay sync cursors and loop-prevention hashes.
+type relaySyncState struct {
+	mu           sync.Mutex
+	pushedCursor string          // last local seq pushed to relay
+	relayCursor  string          // last relay seq pulled from relay
+	pulledHashes map[string]bool // hex(sha256(data)[:8]) of envelopes received FROM relay
+}
+
 // ─── Global state ─────────────────────────────────────────────────────────────
 
 var (
-	bridgeFP string          // hex fingerprint (first 16 bytes of SHA-256(pubkey))
-	signPriv ed25519.PrivateKey
+	bridgeFP   string // hex fingerprint (first 16 bytes of SHA-256(pubkey))
+	bridgeName string // human-readable display name for this bridge (BRIDGE_NAME env)
+	signPriv   ed25519.PrivateKey
 
 	bufMu   sync.RWMutex
 	buffers = map[string]*wsBuffer{} // wsId → *wsBuffer
@@ -89,6 +99,15 @@ var (
 	}
 
 	rng = randmath.New(randmath.NewSource(time.Now().UnixNano()))
+
+	// Relay federation config (optional — set via RELAY_URL / RELAY_TOKEN env vars).
+	relayURL   string // e.g. https://relay.example.workers.dev (no trailing slash)
+	relayToken string // Bearer token for the relay Worker
+
+	relaySyncMu     sync.Mutex
+	relaySyncStates = map[string]*relaySyncState{} // wsId → state
+
+	relayClient = &http.Client{Timeout: 15 * time.Second}
 )
 
 // ─── Keypair ──────────────────────────────────────────────────────────────────
@@ -201,6 +220,187 @@ func (b *wsBuffer) cursor() string {
 	return b.cur
 }
 
+// ─── Relay federation sync ────────────────────────────────────────────────────
+
+func getOrCreateSyncState(wsId string) *relaySyncState {
+	relaySyncMu.Lock()
+	defer relaySyncMu.Unlock()
+	if s, ok := relaySyncStates[wsId]; ok {
+		return s
+	}
+	s := &relaySyncState{pulledHashes: map[string]bool{}}
+	relaySyncStates[wsId] = s
+	return s
+}
+
+// pullWorkspaceFromRelay fetches new envelopes from the relay since our last cursor
+// and stores them in the local buffer. Each pulled envelope's data hash is recorded
+// in pulledHashes so we never re-push it back to the relay (loop prevention).
+func pullWorkspaceFromRelay(wsId string) error {
+	state := getOrCreateSyncState(wsId)
+
+	state.mu.Lock()
+	since := state.relayCursor
+	state.mu.Unlock()
+
+	u := relayURL + "/ws/" + wsId + "/envelopes?limit=100"
+	if since != "" {
+		u += "&since=" + since
+	}
+
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return err
+	}
+	if relayToken != "" {
+		req.Header.Set("Authorization", "Bearer "+relayToken)
+	}
+
+	resp, err := relayClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("relay GET %d", resp.StatusCode)
+	}
+
+	var items []struct {
+		Seq  string `json:"seq"`
+		Data string `json:"data"` // base64-encoded msgpack bytes
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
+		return err
+	}
+
+	if len(items) == 0 {
+		return nil
+	}
+
+	buf := getOrCreateBuffer(wsId)
+	for _, item := range items {
+		// Compute loop-prevention hash BEFORE storing.
+		sum := sha256.Sum256([]byte(item.Data))
+		hashKey := hex.EncodeToString(sum[:8])
+
+		// Store in local LAN buffer so offline-LAN devices can pick it up.
+		buf.put(item.Data)
+
+		// Record that this envelope came from the relay.
+		state.mu.Lock()
+		state.pulledHashes[hashKey] = true
+		state.relayCursor = item.Seq
+		state.mu.Unlock()
+	}
+	log.Printf("[relay-sync] pull %s: %d envelopes", wsId[:8], len(items))
+	return nil
+}
+
+// pushWorkspaceToRelay pushes new local envelopes to the relay.
+// Envelopes that originated from the relay (in pulledHashes) are skipped.
+func pushWorkspaceToRelay(wsId string) error {
+	state := getOrCreateSyncState(wsId)
+
+	state.mu.Lock()
+	since := state.pushedCursor
+	state.mu.Unlock()
+
+	buf := getOrCreateBuffer(wsId)
+	envs := buf.getAfter(since, 100)
+	if len(envs) == 0 {
+		return nil
+	}
+
+	pushed := 0
+	for _, env := range envs {
+		sum := sha256.Sum256([]byte(env.data))
+		hashKey := hex.EncodeToString(sum[:8])
+
+		state.mu.Lock()
+		isPulled := state.pulledHashes[hashKey]
+		state.mu.Unlock()
+
+		if isPulled {
+			// Came from relay — skip to avoid echo loop.
+			state.mu.Lock()
+			state.pushedCursor = env.seq
+			state.mu.Unlock()
+			continue
+		}
+
+		raw, err := base64.StdEncoding.DecodeString(env.data)
+		if err != nil {
+			// Corrupt entry — skip.
+			state.mu.Lock()
+			state.pushedCursor = env.seq
+			state.mu.Unlock()
+			continue
+		}
+
+		req, err := http.NewRequest(http.MethodPut,
+			relayURL+"/ws/"+wsId+"/envelopes",
+			bytes.NewReader(raw))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/octet-stream")
+		if relayToken != "" {
+			req.Header.Set("Authorization", "Bearer "+relayToken)
+		}
+
+		putResp, err := relayClient.Do(req)
+		if err != nil {
+			return err
+		}
+		putResp.Body.Close()
+		if putResp.StatusCode >= 400 {
+			return fmt.Errorf("relay PUT %d", putResp.StatusCode)
+		}
+
+		pushed++
+		state.mu.Lock()
+		state.pushedCursor = env.seq
+		state.mu.Unlock()
+	}
+
+	if pushed > 0 {
+		log.Printf("[relay-sync] push %s: %d envelopes", wsId[:8], pushed)
+	}
+	return nil
+}
+
+// startRelaySync launches the background goroutine that syncs every known
+// workspace buffer with the configured relay every 5 seconds.
+// No-op if RELAY_URL is not set.
+func startRelaySync() {
+	if relayURL == "" {
+		return
+	}
+	log.Printf("[relay-sync] enabled → %s (bridge name: %q)", relayURL, bridgeName)
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			// Snapshot workspace IDs from the live buffer map.
+			bufMu.RLock()
+			wsIds := make([]string, 0, len(buffers))
+			for id := range buffers {
+				wsIds = append(wsIds, id)
+			}
+			bufMu.RUnlock()
+
+			for _, wsId := range wsIds {
+				if err := pullWorkspaceFromRelay(wsId); err != nil {
+					log.Printf("[relay-sync] pull %s: %v", wsId[:8], err)
+				}
+				if err := pushWorkspaceToRelay(wsId); err != nil {
+					log.Printf("[relay-sync] push %s: %v", wsId[:8], err)
+				}
+			}
+		}
+	}()
+}
+
 // ─── HTTP handlers ────────────────────────────────────────────────────────────
 
 // cors adds required headers to every response; also handles OPTIONS preflight.
@@ -224,7 +424,12 @@ func jsonWrite(w http.ResponseWriter, v any) {
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
-	jsonWrite(w, map[string]any{"ok": true, "fp": bridgeFP, "ts": time.Now().UnixMilli()})
+	jsonWrite(w, map[string]any{
+		"ok":   true,
+		"fp":   bridgeFP,
+		"name": bridgeName,
+		"ts":   time.Now().UnixMilli(),
+	})
 }
 
 func handlePeers(w http.ResponseWriter, r *http.Request) {
@@ -405,6 +610,15 @@ func broadcast(exceptPubkey string, msg sigMsg) {
 
 func main() {
 	loadOrCreateKeypair()
+
+	// Optional relay federation config.
+	relayURL   = strings.TrimRight(os.Getenv("RELAY_URL"), "/")
+	relayToken = os.Getenv("RELAY_TOKEN")
+	bridgeName = os.Getenv("BRIDGE_NAME")
+	if bridgeName == "" {
+		bridgeName = "Bridge"
+	}
+	startRelaySync()
 
 	// mDNS registration — announces _mehfil._tcp.local on port 8765.
 	// TXT record carries the fingerprint so clients can verify before connecting.
