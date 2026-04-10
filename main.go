@@ -150,8 +150,22 @@ const (
 	maxEnvsPerWS    = 2000
 	envTTL          = 24 * time.Hour
 	maxPulledHashes = 10_000 // per-workspace cap on the relay loop-prevention set
+	maxWorkspaces   = 200    // cap on distinct workspace IDs kept in memory
+	minWsIdLen      = 8     // reject implausibly short wsIds (avoids wsId[:8] panics)
+	maxWsIdLen      = 128
 )
 
+// getBuffer returns the existing buffer for wsId, or nil if none exists.
+// Read-only callers (GET) use this so they don't create entries for unknown workspaces.
+func getBuffer(wsId string) *wsBuffer {
+	bufMu.RLock()
+	defer bufMu.RUnlock()
+	return buffers[wsId]
+}
+
+// getOrCreateBuffer returns the buffer for wsId, creating one if needed.
+// Only PUT paths (writes) should call this so the map doesn't grow on reads.
+// Returns nil if the workspace cap (maxWorkspaces) is already reached.
 func getOrCreateBuffer(wsId string) *wsBuffer {
 	bufMu.RLock()
 	b := buffers[wsId]
@@ -162,9 +176,23 @@ func getOrCreateBuffer(wsId string) *wsBuffer {
 	bufMu.Lock()
 	defer bufMu.Unlock()
 	if buffers[wsId] == nil {
+		if len(buffers) >= maxWorkspaces {
+			return nil
+		}
 		buffers[wsId] = &wsBuffer{}
 	}
 	return buffers[wsId]
+}
+
+// validateWsId returns an error string (non-empty) if wsId is not safe to use.
+func validateWsId(wsId string) string {
+	if len(wsId) < minWsIdLen {
+		return "workspace id too short"
+	}
+	if len(wsId) > maxWsIdLen {
+		return "workspace id too long"
+	}
+	return ""
 }
 
 func newSeq() string {
@@ -270,7 +298,9 @@ func pullWorkspaceFromRelay(wsId string) error {
 		Seq  string `json:"seq"`
 		Data string `json:"data"` // base64-encoded msgpack bytes
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
+	// 10 MB is very generous for 100 × 1 KB envelopes; guards against a
+	// compromised or misconfigured relay returning an unbounded response body.
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 10<<20)).Decode(&items); err != nil {
 		return err
 	}
 
@@ -457,6 +487,10 @@ func handleEnvelopes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wsId := parts[1]
+	if msg := validateWsId(wsId); msg != "" {
+		http.Error(w, msg, http.StatusBadRequest)
+		return
+	}
 
 	switch r.Method {
 	case http.MethodPut:
@@ -474,7 +508,12 @@ func handleEnvelopes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		data := base64.StdEncoding.EncodeToString(body)
-		getOrCreateBuffer(wsId).put(data)
+		buf := getOrCreateBuffer(wsId)
+		if buf == nil {
+			http.Error(w, "too many workspaces", http.StatusServiceUnavailable)
+			return
+		}
+		buf.put(data)
 		w.WriteHeader(http.StatusNoContent)
 
 	case http.MethodGet:
@@ -486,10 +525,17 @@ func handleEnvelopes(w http.ResponseWriter, r *http.Request) {
 			}
 			limit = l
 		}
-		envs := getOrCreateBuffer(wsId).getAfter(since, limit)
-		out := make([]map[string]string, len(envs))
-		for i, e := range envs {
-			out[i] = map[string]string{"seq": e.seq, "data": e.data}
+		// GET uses getBuffer (read-only) — never creates a new entry.
+		buf := getBuffer(wsId)
+		var out []map[string]string
+		if buf != nil {
+			envs := buf.getAfter(since, limit)
+			out = make([]map[string]string, len(envs))
+			for i, e := range envs {
+				out[i] = map[string]string{"seq": e.seq, "data": e.data}
+			}
+		} else {
+			out = []map[string]string{}
 		}
 		jsonWrite(w, out)
 
@@ -505,7 +551,16 @@ func handleCursor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wsId := parts[1]
-	cur := getOrCreateBuffer(wsId).cursor()
+	if msg := validateWsId(wsId); msg != "" {
+		http.Error(w, msg, http.StatusBadRequest)
+		return
+	}
+	// Read-only — never create a buffer for an unknown workspace.
+	buf := getBuffer(wsId)
+	cur := ""
+	if buf != nil {
+		cur = buf.cursor()
+	}
 	jsonWrite(w, map[string]string{"cursor": cur})
 }
 
@@ -515,6 +570,12 @@ func handleSignal(w http.ResponseWriter, r *http.Request) {
 	pubkey := r.URL.Query().Get("pubkey")
 	if pubkey == "" {
 		http.Error(w, "pubkey required", http.StatusBadRequest)
+		return
+	}
+	// Bound pubkey length — it's a base64url Ed25519 public key (~43 chars).
+	// A huge pubkey would be broadcast as JSON to every connected peer.
+	if len(pubkey) > 128 {
+		http.Error(w, "pubkey too long", http.StatusBadRequest)
 		return
 	}
 
@@ -557,6 +618,11 @@ func handleSignal(w http.ResponseWriter, r *http.Request) {
 		}
 		conn.Close()
 	}()
+
+	// Cap incoming message size — SDP offers/answers and ICE candidates are tiny.
+	// Without this limit a peer can send a huge message that gets buffered and
+	// forwarded, causing unbounded memory allocation per relay.
+	conn.SetReadLimit(4 * 1024)
 
 	// Read pump — routes incoming messages to the target peer.
 	defer func() {
