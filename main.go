@@ -2,17 +2,19 @@
 //
 // Announces itself via mDNS (_mehfil._tcp.local) and serves:
 //   GET  /health                         — liveness + fingerprint
-//   GET  /peers                          — currently-connected signaling peers
 //   PUT  /ws/{id}/envelopes              — store envelope (24h in-memory)
 //   GET  /ws/{id}/envelopes?since&limit  — fetch envelopes since cursor
 //   GET  /ws/{id}/cursor                 — latest cursor
-//   WS   /signal?pubkey={b64url}         — WebRTC offer/answer/ICE relay
 //
 // Auth: none — the bridge fingerprint is the trust anchor.
 // All responses carry X-Bridge-Fp and CORS headers.
 //
 // Keypair stored at ~/.mehfil-bridge/key (never in the repo).
 // All envelope data is in-memory; restarts lose the buffer.
+//
+// WebRTC signaling rides on the regular envelope path (huddle.signal
+// envelopes in the Mehfil app, see naklios-universe/Mehfil/index.html);
+// the bridge has no dedicated /signal endpoint.
 
 package main
 
@@ -37,7 +39,6 @@ import (
 	"time"
 
 	"github.com/grandcat/zeroconf"
-	"github.com/gorilla/websocket"
 )
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -54,21 +55,6 @@ type wsBuffer struct {
 	mu   sync.RWMutex
 	envs []storedEnv
 	cur  string // latest seq
-}
-
-// sigMsg is the JSON shape for /signal WebSocket messages.
-type sigMsg struct {
-	Type    string `json:"type"`              // "offer"|"answer"|"ice"|"peer_joined"|"peer_left"
-	To      string `json:"to,omitempty"`      // target pubkey (sender fills)
-	From    string `json:"from,omitempty"`    // source pubkey (bridge fills)
-	Pubkey  string `json:"pubkey,omitempty"`  // used in peer_joined/peer_left
-	Payload string `json:"payload,omitempty"` // SDP or ICE candidate
-}
-
-// sigPeer is one connected WebSocket peer in the signaling hub.
-type sigPeer struct {
-	pubkey string
-	send   chan []byte
 }
 
 // relaySyncState tracks per-workspace relay sync cursors and loop-prevention hashes.
@@ -88,15 +74,6 @@ var (
 
 	bufMu   sync.RWMutex
 	buffers = map[string]*wsBuffer{} // wsId → *wsBuffer
-
-	peerMu sync.RWMutex
-	peers  = map[string]*sigPeer{} // pubkey → *sigPeer
-
-	upgrader = websocket.Upgrader{
-		ReadBufferSize:  64 * 1024,
-		WriteBufferSize: 64 * 1024,
-		CheckOrigin:     func(r *http.Request) bool { return true }, // allow all origins (LAN)
-	}
 
 	rng = randmath.New(randmath.NewSource(time.Now().UnixNano()))
 
@@ -468,16 +445,6 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func handlePeers(w http.ResponseWriter, r *http.Request) {
-	peerMu.RLock()
-	list := make([]string, 0, len(peers))
-	for pk := range peers {
-		list = append(list, pk)
-	}
-	peerMu.RUnlock()
-	jsonWrite(w, map[string]any{"peers": list, "fp": bridgeFP})
-}
-
 // handleEnvelopes handles both PUT (store) and GET (fetch) for /ws/{id}/envelopes.
 func handleEnvelopes(w http.ResponseWriter, r *http.Request) {
 	// Extract workspace ID from path: /ws/{id}/envelopes
@@ -564,128 +531,6 @@ func handleCursor(w http.ResponseWriter, r *http.Request) {
 	jsonWrite(w, map[string]string{"cursor": cur})
 }
 
-// ─── WebSocket signaling hub ──────────────────────────────────────────────────
-
-func handleSignal(w http.ResponseWriter, r *http.Request) {
-	pubkey := r.URL.Query().Get("pubkey")
-	if pubkey == "" {
-		http.Error(w, "pubkey required", http.StatusBadRequest)
-		return
-	}
-	// Bound pubkey length — it's a base64url Ed25519 public key (~43 chars).
-	// A huge pubkey would be broadcast as JSON to every connected peer.
-	if len(pubkey) > 128 {
-		http.Error(w, "pubkey too long", http.StatusBadRequest)
-		return
-	}
-
-	conn, err := upgrader.Upgrade(w, r, http.Header{"X-Bridge-Fp": {bridgeFP}})
-	if err != nil {
-		log.Println("ws upgrade:", err)
-		return
-	}
-
-	peer := &sigPeer{pubkey: pubkey, send: make(chan []byte, 64)}
-
-	// Register peer and announce to existing peers.
-	peerMu.Lock()
-	if old, ok := peers[pubkey]; ok {
-		close(old.send) // evict stale connection
-	}
-	peers[pubkey] = peer
-	// Collect existing peer list before releasing the lock.
-	existing := make([]string, 0, len(peers)-1)
-	for pk := range peers {
-		if pk != pubkey {
-			existing = append(existing, pk)
-		}
-	}
-	peerMu.Unlock()
-
-	broadcast(pubkey, sigMsg{Type: "peer_joined", Pubkey: pubkey})
-
-	// Tell the new peer about everyone already online.
-	for _, pk := range existing {
-		send(peer, sigMsg{Type: "peer_joined", Pubkey: pk})
-	}
-
-	// Write pump — flushes the send channel to the WebSocket.
-	go func() {
-		for msg := range peer.send {
-			if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-				break
-			}
-		}
-		conn.Close()
-	}()
-
-	// Cap incoming message size — SDP offers/answers and ICE candidates are tiny.
-	// Without this limit a peer can send a huge message that gets buffered and
-	// forwarded, causing unbounded memory allocation per relay.
-	conn.SetReadLimit(4 * 1024)
-
-	// Read pump — routes incoming messages to the target peer.
-	defer func() {
-		peerMu.Lock()
-		if peers[pubkey] == peer {
-			delete(peers, pubkey)
-		}
-		peerMu.Unlock()
-		close(peer.send)
-		broadcast(pubkey, sigMsg{Type: "peer_left", Pubkey: pubkey})
-	}()
-
-	for {
-		_, raw, err := conn.ReadMessage()
-		if err != nil {
-			break
-		}
-		var msg sigMsg
-		if err := json.Unmarshal(raw, &msg); err != nil {
-			continue
-		}
-		msg.From = pubkey
-		if msg.To == "" {
-			continue
-		}
-		peerMu.RLock()
-		target := peers[msg.To]
-		peerMu.RUnlock()
-		if target != nil {
-			send(target, msg)
-		}
-	}
-}
-
-func send(p *sigPeer, msg sigMsg) {
-	raw, err := json.Marshal(msg)
-	if err != nil {
-		return
-	}
-	select {
-	case p.send <- raw:
-	default: // drop if send buffer is full
-	}
-}
-
-func broadcast(exceptPubkey string, msg sigMsg) {
-	raw, err := json.Marshal(msg)
-	if err != nil {
-		return
-	}
-	peerMu.RLock()
-	defer peerMu.RUnlock()
-	for pk, p := range peers {
-		if pk == exceptPubkey {
-			continue
-		}
-		select {
-		case p.send <- raw:
-		default:
-		}
-	}
-}
-
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 func main() {
@@ -720,8 +565,6 @@ func main() {
 	// HTTP routes.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", cors(handleHealth))
-	mux.HandleFunc("/peers", cors(handlePeers))
-	mux.HandleFunc("/signal", cors(handleSignal)) // WebSocket
 	mux.HandleFunc("/ws/", func(w http.ResponseWriter, r *http.Request) {
 		// Route /ws/{id}/envelopes and /ws/{id}/cursor
 		w.Header().Set("Access-Control-Allow-Origin", "*")

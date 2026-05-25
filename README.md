@@ -6,8 +6,9 @@ LAN bridge for [Mehfil](https://github.com/NakliTechie/Mehfil). Lets devices on 
 
 - **Announces itself via mDNS** (`_mehfil._tcp.local` on port 8765) so Mehfil finds it automatically on your LAN
 - **Store-and-forward relay** — buffers the last 24h of messages in memory; devices fetch what they missed
-- **WebRTC signaling hub** — relays WebRTC offer/answer/ICE between peers on the LAN so they can establish direct connections
 - **Signed with a keypair** — every response includes `X-Bridge-Fp` (your bridge fingerprint); Mehfil pins this on first connect so you know you're always talking to the same bridge
+
+WebRTC signaling for huddles rides on the regular envelope path (the `huddle.signal` envelope type in the Mehfil app); the bridge has no dedicated signaling endpoint.
 
 ---
 
@@ -127,11 +128,6 @@ All responses include `X-Bridge-Fp: <fingerprint>` and `Access-Control-Allow-Ori
 { "ok": true, "fp": "a3f2b1e4c9d07812", "ts": 1712345678000 }
 ```
 
-### `GET /peers`
-```json
-{ "peers": ["<pubkey1>", "<pubkey2>"], "fp": "a3f2b1e4c9d07812" }
-```
-
 ### `PUT /ws/:ws_id/envelopes`
 Store one envelope. Body: raw msgpack bytes. Returns `204`.
 
@@ -140,18 +136,6 @@ Returns `[{ "seq": "...", "data": "<base64>" }, ...]`. Max 500 results.
 
 ### `GET /ws/:ws_id/cursor`
 Returns `{ "cursor": "..." }`.
-
-### `WebSocket /signal?pubkey=<b64url_pubkey>`
-WebRTC signaling channel. Send:
-```json
-{ "type": "offer", "to": "<target_pubkey>", "payload": "<sdp>" }
-```
-Receive:
-```json
-{ "type": "offer", "from": "<sender_pubkey>", "payload": "<sdp>" }
-{ "type": "peer_joined", "pubkey": "<pubkey>" }
-{ "type": "peer_left",   "pubkey": "<pubkey>" }
-```
 
 ---
 
